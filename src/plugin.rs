@@ -22,6 +22,12 @@ use crate::utils::{get_id_from_tao_id, get_label_from_tao_id};
 /// A map of EguiWindow instances, keyed by their Tauri window label.
 type EguiWindowMap = Arc<Mutex<HashMap<String, EguiWindow>>>;
 
+pub struct StagingWindowWrapper {
+    pub window: Option<(String, EguiWindow)>,
+}
+
+type StagingWindow = Arc<Mutex<StagingWindowWrapper>>;
+
 // The builder pattern is mandatorily needed for a Tauri `.wry_plugin()`
 // It sets up the tauri state + offers a hook into the event system
 pub struct Builder {
@@ -39,19 +45,23 @@ impl<T: UserEvent> PluginBuilder<T> for Builder {
 
     fn build(self, _: Context<T>) -> Self::Plugin {
         let egui_window_map: EguiWindowMap = Arc::new(Mutex::new(HashMap::new()));
+        let staging_window: StagingWindow = Arc::new(Mutex::new(StagingWindowWrapper { window: None }));
         self.app.manage(egui_window_map.clone());
-        EguiPlugin::new(egui_window_map)
+        self.app.manage(staging_window.clone());
+        EguiPlugin::new(staging_window, egui_window_map)
     }
 }
 
 pub struct EguiPlugin<T: UserEvent> {
+    staging_window: StagingWindow,
     windows: EguiWindowMap,
     _phantom: std::marker::PhantomData<T>, // this does nothing, just keeps compiler happy
 }
 
 impl<T: UserEvent> EguiPlugin<T> {
-    fn new(windows: EguiWindowMap) -> Self {
+    fn new(staging_window: StagingWindow, windows: EguiWindowMap) -> Self {
         Self {
+            staging_window,
             windows,
             _phantom: std::marker::PhantomData,
         }
@@ -74,6 +84,18 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
             } => {
                 if let Some(label) = get_label_from_tao_id(window_id, &context) {
                     let mut windows = self.windows.lock().unwrap();
+                    if !windows.contains_key(&label) {
+                        let mut staging_window = self.staging_window.lock().unwrap();
+                        let staging_lable_opt = staging_window.window.as_ref()
+                            .map(|(l, _w)| l.clone());
+                        if let Some(staging_label) = staging_lable_opt {
+                            if label == staging_label {
+                                // extract the window from the staging window
+                                let (label, window) = staging_window.window.take().unwrap();
+                                windows.insert(label, window);
+                            } 
+                        }
+                    }
                     if let Some(egui_win) = windows.get_mut(&label) {
                         match event {
                             TaoWindowEvent::Resized(size) => {
@@ -106,6 +128,18 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
             Event::RedrawRequested(window_id) => {
                 if let Some(label) = get_label_from_tao_id(window_id, &context) {
                     let mut windows = self.windows.lock().unwrap();
+                    if !windows.contains_key(&label) {
+                        let mut staging_window = self.staging_window.lock().unwrap();
+                        let staging_lable_opt = staging_window.window.as_ref()
+                            .map(|(l, _w)| l.clone());
+                        if let Some(staging_label) = staging_lable_opt {
+                            if label == staging_label {
+                                // extract the window from the staging window
+                                let (label, window) = staging_window.window.take().unwrap();
+                                windows.insert(label, window);
+                            }
+                        }
+                    }
                     if let Some(egui_win) = windows.get_mut(&label) {
                         // Get the egui context from the EguiWindow
                         let raw_input = egui_win.take_egui_input();
@@ -255,6 +289,13 @@ impl EguiWindow {
                 true
             }
             TaoWindowEvent::KeyboardInput { event, .. } => self.handle_keyboard_event(event),
+            TaoWindowEvent::ReceivedImeText(txt) => {
+                self.egui_input.events.push(egui::Event::Text(txt.to_string()));
+                true
+            }
+            TaoWindowEvent::Moved(phy_pos) => {
+                false
+            }
             _ => false,
         }
     }
@@ -516,11 +557,6 @@ impl AppHandleExt for AppHandle {
         label: &str,
         ui_fn: Box<dyn FnMut(&egui::Context)>,
     ) -> Result<(), Error> {
-        // check if plugin is init'd
-        let egui_windows = self
-            .try_state::<EguiWindowMap>()
-            .ok_or(Error::msg("TauriPluginEgui is not initialized"))?;
-
         // check if window exists
         let window = self
             .get_window(label)
@@ -539,9 +575,14 @@ impl AppHandleExt for AppHandle {
                 async move { Renderer::new(window, width, height).await },
             )?;
 
+        // check if plugin is init'd
+        let staging_window= self
+            .try_state::<StagingWindow>()
+            .ok_or(Error::msg("TauriPluginEgui is not initialized"))?;
+
         // track in the plugin state
-        let mut managed_windows = egui_windows.lock().unwrap();
-        managed_windows.insert(
+        let mut stage_window = staging_window.lock().unwrap();
+        stage_window.window = Some((
             label.to_string(),
             EguiWindow {
                 context,
@@ -554,7 +595,7 @@ impl AppHandleExt for AppHandle {
                 scale_factor,
                 modifiers: egui::Modifiers::NONE,
             },
-        );
+        ));
 
         Ok(())
     }
