@@ -411,6 +411,8 @@ impl EguiWindow {
                 self.size.height as f32 / self.scale_factor,
             ),
         ));
+        let max_texture_side = wgpu::Limits::default().max_texture_dimension_2d as usize;
+        input.max_texture_side = Some(max_texture_side);
         input
     }
 }
