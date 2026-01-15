@@ -15,6 +15,10 @@ anyhow = "1.0.98"
 wgpu = "25"
 egui = "0.32"
 egui-wgpu = "0.32"
+rdev = { git = "https://github.com/jason-ni/rdev.git", branch = "kunkun", features = [
+    "serialize",
+] }
+serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 tauri-plugin = { version = "2.3.0", features = ["build"] }

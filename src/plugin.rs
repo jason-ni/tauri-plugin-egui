@@ -1,9 +1,10 @@
 use anyhow::Error;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
+use serde::{Deserialize, Serialize};
 
-use tauri::{AppHandle, Manager, PhysicalSize};
+use tauri::{AppHandle, Manager, PhysicalSize, Emitter};
 use tauri_runtime::window::CursorIcon;
 use tauri_runtime::UserEvent;
 
@@ -21,6 +22,12 @@ use crate::utils::{get_id_from_tao_id, get_label_from_tao_id};
 
 /// A map of EguiWindow instances, keyed by their Tauri window label.
 type EguiWindowMap = Arc<Mutex<HashMap<String, EguiWindow>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WheelEvent {
+    delta_x: i64,
+    delta_y: i64,
+}
 
 pub struct StagingWindowWrapper {
     pub window: Option<(String, EguiWindow)>,
@@ -48,21 +55,27 @@ impl<T: UserEvent> PluginBuilder<T> for Builder {
         let staging_window: StagingWindow = Arc::new(Mutex::new(StagingWindowWrapper { window: None }));
         self.app.manage(egui_window_map.clone());
         self.app.manage(staging_window.clone());
-        EguiPlugin::new(staging_window, egui_window_map)
+        EguiPlugin::new(self.app.clone(), staging_window, egui_window_map)
     }
 }
 
 pub struct EguiPlugin<T: UserEvent> {
+    app: AppHandle,
     staging_window: StagingWindow,
     windows: EguiWindowMap,
+    is_rdev_loop_running: Arc<AtomicBool>,
+    rdev_thread_join_handle: Option<std::thread::JoinHandle<()>>,
     _phantom: std::marker::PhantomData<T>, // this does nothing, just keeps compiler happy
 }
 
 impl<T: UserEvent> EguiPlugin<T> {
-    fn new(staging_window: StagingWindow, windows: EguiWindowMap) -> Self {
+    fn new(app: AppHandle,staging_window: StagingWindow, windows: EguiWindowMap) -> Self {
         Self {
+            app,
             staging_window,
             windows,
+            is_rdev_loop_running: Arc::new(AtomicBool::new(false)),
+            rdev_thread_join_handle: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -78,11 +91,50 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
         context: EventLoopIterationContext<'_, T>,
         _: &WebContextStore,
     ) -> bool {
+        if let Event::LoopDestroyed = event {
+            self.is_rdev_loop_running.store(false, Ordering::SeqCst);
+
+            println!("==== we got loop destroyed, waiting for the rdev thread to join ====");
+            if let Some(handle) = self.rdev_thread_join_handle.take() {
+                let _ = rdev::stop_listen();
+                let _ = handle.join(); 
+            }
+            return false;
+        }
+
+
         match event {
             Event::WindowEvent {
                 event, window_id, ..
             } => {
+
                 if let Some(label) = get_label_from_tao_id(window_id, &context) {
+                    // we inject a rdev event loop to handle other app window's events
+                    if let Some(win_id) = get_id_from_tao_id(window_id, &context) {
+                        if !self.is_rdev_loop_running.load(Ordering::SeqCst) {
+                            let rdev_proxy = proxy.clone();
+                            self.is_rdev_loop_running.store(true, Ordering::SeqCst);
+                            let is_rdev_loop_running = self.is_rdev_loop_running.clone();
+                            let rdev_app_handle = self.app.clone();
+                            let handle = std::thread::spawn(move || {
+                                if let Err(e) = rdev::listen(move |event| {
+                                    if !is_rdev_loop_running.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    if let rdev::EventType::Wheel { delta_x, delta_y } = event.event_type {
+                                        let _ = rdev_app_handle.emit("global_wheel_event", WheelEvent { delta_x, delta_y });
+                                        let _ = rdev_proxy.send_event(
+                                            Message::Window(win_id, WindowMessage::RequestRedraw),
+                                        );
+                                    }
+                                }) {
+                                    eprintln!("Error listening to rdev events: {:?}", e);
+                                }
+                            });
+                            self.rdev_thread_join_handle = Some(handle);
+                        }
+                    }
+
                     let mut windows = self.windows.lock().unwrap();
                     if !windows.contains_key(&label) {
                         let mut staging_window = self.staging_window.lock().unwrap();
