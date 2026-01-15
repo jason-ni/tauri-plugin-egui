@@ -15,9 +15,7 @@ anyhow = "1.0.98"
 wgpu = "25"
 egui = "0.32"
 egui-wgpu = "0.32"
-rdev = { git = "https://github.com/jason-ni/rdev.git", branch = "kunkun", features = [
-    "serialize",
-] }
+rdev = { git = "https://github.com/fufesou/rdev" }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]

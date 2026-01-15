@@ -96,7 +96,6 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
 
             println!("==== we got loop destroyed, waiting for the rdev thread to join ====");
             if let Some(handle) = self.rdev_thread_join_handle.take() {
-                let _ = rdev::stop_listen();
                 let _ = handle.join(); 
             }
             return false;
