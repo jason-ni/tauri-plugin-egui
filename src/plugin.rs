@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
-use tauri::{AppHandle, Manager, PhysicalSize, Emitter};
+use tauri::{AppHandle, Manager, PhysicalSize, Emitter, Listener};
 use tauri_runtime::window::CursorIcon;
 use tauri_runtime::UserEvent;
 
@@ -25,8 +25,8 @@ type EguiWindowMap = Arc<Mutex<HashMap<String, EguiWindow>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WheelEvent {
-    delta_x: i64,
-    delta_y: i64,
+    pub delta_x: i64,
+    pub delta_y: i64,
 }
 
 pub struct StagingWindowWrapper {
@@ -111,10 +111,11 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                     // we inject a rdev event loop to handle other app window's events
                     if let Some(win_id) = get_id_from_tao_id(window_id, &context) {
                         if !self.is_rdev_loop_running.load(Ordering::SeqCst) {
-                            let rdev_proxy = proxy.clone();
+                            let redraw_proxy = proxy.clone();
                             self.is_rdev_loop_running.store(true, Ordering::SeqCst);
                             let is_rdev_loop_running = self.is_rdev_loop_running.clone();
                             let rdev_app_handle = self.app.clone();
+                            let redraw_app_handle = self.app.clone();
                             let handle = std::thread::spawn(move || {
                                 if let Err(e) = rdev::listen(move |event| {
                                     if !is_rdev_loop_running.load(Ordering::SeqCst) {
@@ -122,15 +123,22 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                                     }
                                     if let rdev::EventType::Wheel { delta_x, delta_y } = event.event_type {
                                         let _ = rdev_app_handle.emit("global_wheel_event", WheelEvent { delta_x, delta_y });
-                                        let _ = rdev_proxy.send_event(
-                                            Message::Window(win_id, WindowMessage::RequestRedraw),
-                                        );
                                     }
                                 }) {
                                     eprintln!("Error listening to rdev events: {:?}", e);
                                 }
                             });
                             self.rdev_thread_join_handle = Some(handle);
+
+                            // we let the up layer logic to request redraw when needed
+                            std::thread::spawn(move || {
+                                redraw_app_handle.listen("egui_redraw", move |_| {
+                                    let _ = redraw_proxy.send_event(
+                                        Message::Window(win_id, WindowMessage::RequestRedraw),
+                                    );
+
+                                });
+                            });
                         }
                     }
 
@@ -153,6 +161,10 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                                 egui_win.size = PhysicalSize::new(size.width, size.height);
                                 egui_win.renderer.resize(size.width, size.height);
                                 return true;
+                            }
+                            TaoWindowEvent::Destroyed => {
+                                windows.remove(&label);
+                                return false;
                             }
                             _ => {
                                 let consumed = egui_win.handle_event(event);
@@ -260,6 +272,7 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
 
 /// A collection egui context, renderer and a UI function
 struct EguiWindow {
+    label: String,
     context: egui::Context,
     renderer: Renderer,
     size: PhysicalSize<u32>,
@@ -346,6 +359,12 @@ impl EguiWindow {
             }
             TaoWindowEvent::Moved(phy_pos) => {
                 false
+            }
+            TaoWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale_factor = *scale_factor as f32;
+                self.context.set_pixels_per_point(self.scale_factor);
+                self.context.request_repaint();
+                true
             }
             _ => false,
         }
@@ -638,6 +657,7 @@ impl AppHandleExt for AppHandle {
         stage_window.window = Some((
             label.to_string(),
             EguiWindow {
+                label: label.to_string(),
                 context,
                 renderer,
                 ui_fn,
