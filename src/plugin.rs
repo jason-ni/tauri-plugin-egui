@@ -163,6 +163,9 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                                 return true;
                             }
                             TaoWindowEvent::Destroyed => {
+                                if let Some(mut on_destroy) = egui_win.on_destroy.take() {
+                                    on_destroy(label.clone());
+                                }
                                 windows.remove(&label);
                                 return false;
                             }
@@ -277,6 +280,7 @@ struct EguiWindow {
     renderer: Renderer,
     size: PhysicalSize<u32>,
     ui_fn: Box<dyn FnMut(&egui::Context)>,
+    on_destroy: Option<Box<dyn FnMut(String)>>,
     start_time: Instant,
     egui_input: egui::RawInput,
     pointer_pos: Option<egui::Pos2>,
@@ -364,7 +368,7 @@ impl EguiWindow {
                 self.scale_factor = *scale_factor as f32;
                 self.context.set_pixels_per_point(self.scale_factor);
                 self.context.request_repaint();
-                true
+                false 
             }
             _ => false,
         }
@@ -620,6 +624,7 @@ pub trait AppHandleExt {
         &self,
         label: &str,
         ui_fn: Box<dyn FnMut(&egui::Context)>,
+        on_destroy: Option<Box<dyn FnMut(String)>>,
     ) -> Result<(), Error>;
 }
 
@@ -628,6 +633,7 @@ impl AppHandleExt for AppHandle {
         &self,
         label: &str,
         ui_fn: Box<dyn FnMut(&egui::Context)>,
+        on_destroy: Option<Box<dyn FnMut(String)>>,
     ) -> Result<(), Error> {
         // check if window exists
         let window = self
@@ -661,6 +667,7 @@ impl AppHandleExt for AppHandle {
                 context,
                 renderer,
                 ui_fn,
+                on_destroy,
                 size,
                 start_time: Instant::now(),
                 egui_input: egui::RawInput::default(),
