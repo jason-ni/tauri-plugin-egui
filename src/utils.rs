@@ -83,7 +83,9 @@ pub struct WindowGlowContext {
 
 pub fn create_window_painter(window: &tauri::Window) -> Result<WindowGlowContext, anyhow::Error>{
     let display = get_window_display(window);
-    let template = glutin::config::ConfigTemplateBuilder::new().with_alpha_size(8).build();
+    let template = glutin::config::ConfigTemplateBuilder::new()
+        .with_transparency(true)
+        .with_alpha_size(8).build();
     let gl_config = unsafe {
         let configs = display.find_configs(template).expect("No gl display configs found");
         gl_config_picker(configs)
@@ -132,8 +134,9 @@ pub fn create_window_painter(window: &tauri::Window) -> Result<WindowGlowContext
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-           .with_transparent(true),
-           ..Default::default()
+            .with_has_shadow(false)
+            .with_transparent(true),
+            ..Default::default()
     };
 
     let swap_interval = if options.vsync {

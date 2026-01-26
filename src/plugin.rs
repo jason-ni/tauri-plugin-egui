@@ -264,11 +264,8 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                         let is_current = egui_win.win_glow_context.gl_surface.is_current(egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context"));
 
                         // Finally we render textures, paint jobs, etc. using the GPU
-                        egui_glow::painter::clear(
-                            egui_win.win_glow_context.painter.gl(),
-                            screen_descriptor.size_in_pixels,
-                            [0.0, 0.0, 0.0, 0.0],
-                        );
+                        egui_win.win_glow_context.painter.clear(
+                            screen_descriptor.size_in_pixels, [0.0, 0.0, 0.0, 0.0],);
 
                         egui_win.win_glow_context.painter.paint_and_update_textures(
                             screen_descriptor.size_in_pixels,
