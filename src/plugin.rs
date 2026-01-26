@@ -1,5 +1,8 @@
 use anyhow::Error;
+use glutin::surface::GlSurface;
+use eframe::native::glow_integration::change_gl_context;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,6 @@ use tauri_runtime_wry::tao::event::{
 use tauri_runtime_wry::tao::event_loop::{ControlFlow, EventLoopProxy, EventLoopWindowTarget};
 use tauri_runtime_wry::tao::keyboard::{Key, KeyCode};
 
-use crate::renderer::Renderer;
 use crate::utils::{get_id_from_tao_id, get_label_from_tao_id};
 
 /// A map of EguiWindow instances, keyed by their Tauri window label.
@@ -159,13 +161,26 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                         match event {
                             TaoWindowEvent::Resized(size) => {
                                 egui_win.size = PhysicalSize::new(size.width, size.height);
-                                egui_win.renderer.resize(size.width, size.height);
+                                let width_px = NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN);
+                                let height_px = NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN);
+                                change_gl_context(
+                                    &mut egui_win.win_glow_context.gl_possible_current_context,
+                                    &mut egui_win.win_glow_context.gl_not_current_context,
+                                    &mut egui_win.win_glow_context.gl_surface);
+                                egui_win.win_glow_context.gl_surface.resize(
+                                    egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context"),
+                                    width_px,
+                                    height_px,
+                                );
+                                //egui_win.renderer.resize(size.width, size.height);
                                 return true;
                             }
                             TaoWindowEvent::Destroyed => {
                                 if let Some(mut on_destroy) = egui_win.on_destroy.take() {
                                     on_destroy(label.clone());
                                 }
+                                egui_win.context.forget_all_images();
+                                egui_win.win_glow_context.painter.destroy();
                                 windows.remove(&label);
                                 return false;
                             }
@@ -246,12 +261,26 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                             pixels_per_point: pixels_per_point,
                         };
 
+                        let is_current = egui_win.win_glow_context.gl_surface.is_current(egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context"));
+
                         // Finally we render textures, paint jobs, etc. using the GPU
-                        egui_win.renderer.render_frame(
-                            screen_descriptor,
-                            paint_jobs,
-                            textures_delta,
+                        egui_glow::painter::clear(
+                            egui_win.win_glow_context.painter.gl(),
+                            screen_descriptor.size_in_pixels,
+                            [0.0, 0.0, 0.0, 0.0],
                         );
+
+                        egui_win.win_glow_context.painter.paint_and_update_textures(
+                            screen_descriptor.size_in_pixels,
+                            screen_descriptor.pixels_per_point,
+                            &paint_jobs,
+                            &textures_delta,
+                        );
+
+                        if let Err(err) = egui_win.win_glow_context.gl_surface.swap_buffers(
+                            &egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context")) {
+                            println!("swap_buffers failed: {err}");
+                        }
 
                         // Check if egui wants us to repaint and request another redraw
                         if egui_win.context.has_requested_repaint() {
@@ -277,7 +306,7 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
 struct EguiWindow {
     label: String,
     context: egui::Context,
-    renderer: Renderer,
+    win_glow_context: super::utils::WindowGlowContext,
     size: PhysicalSize<u32>,
     ui_fn: Box<dyn FnMut(&egui::Context)>,
     on_destroy: Option<Box<dyn FnMut(String)>>,
@@ -648,10 +677,8 @@ impl AppHandleExt for AppHandle {
         // create egui context + renderer
         let context = egui::Context::default();
         context.set_zoom_factor(scale_factor);
-        let renderer =
-            tauri::async_runtime::block_on(
-                async move { Renderer::new(window, width, height).await },
-            )?;
+
+        let win_glow_context = super::utils::create_window_painter(&window)?;
 
         // check if plugin is init'd
         let staging_window= self
@@ -665,7 +692,7 @@ impl AppHandleExt for AppHandle {
             EguiWindow {
                 label: label.to_string(),
                 context,
-                renderer,
+                win_glow_context,
                 ui_fn,
                 on_destroy,
                 size,
