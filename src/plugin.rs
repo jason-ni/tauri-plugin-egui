@@ -1,11 +1,16 @@
 use anyhow::Error;
-use glutin::surface::GlSurface;
 use eframe::native::glow_integration::change_gl_context;
 use std::collections::HashMap;
-use std::num::NonZeroU32;
+use std::num::{NonZero, NonZeroU32};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
+
+use glutin::display::{GlDisplay, GetGlDisplay};
+use glutin::config::GlConfig;
+use glutin::{context::{ContextAttributes, ContextAttributesBuilder}, prelude::NotCurrentGlContext};
+use glutin::context::{NotCurrentContext, PossiblyCurrentContext};
+use glutin::surface::{Surface, GlSurface, SurfaceTypeTrait, WindowSurface};
 
 use tauri::{AppHandle, Manager, PhysicalSize, Emitter, Listener};
 use tauri_runtime::window::CursorIcon;
@@ -20,7 +25,7 @@ use tauri_runtime_wry::tao::event::{
 use tauri_runtime_wry::tao::event_loop::{ControlFlow, EventLoopProxy, EventLoopWindowTarget};
 use tauri_runtime_wry::tao::keyboard::{Key, KeyCode};
 
-use crate::utils::{get_id_from_tao_id, get_label_from_tao_id};
+use crate::utils::{get_id_from_tao_id, get_label_from_tao_id, gen_display, gl_config_picker, get_raw_window_handle};
 
 /// A map of EguiWindow instances, keyed by their Tauri window label.
 type EguiWindowMap = Arc<Mutex<HashMap<String, EguiWindow>>>;
@@ -33,6 +38,10 @@ pub struct WheelEvent {
 
 pub struct StagingWindowWrapper {
     pub window: Option<(String, EguiWindow)>,
+}
+
+pub struct GlContext {
+
 }
 
 type StagingWindow = Arc<Mutex<StagingWindowWrapper>>;
@@ -67,7 +76,118 @@ pub struct EguiPlugin<T: UserEvent> {
     windows: EguiWindowMap,
     is_rdev_loop_running: Arc<AtomicBool>,
     rdev_thread_join_handle: Option<std::thread::JoinHandle<()>>,
+    gl_display: Option<glutin::display::Display>,
+    gl_config: Option<glutin::config::Config>,
+    gl_not_current_context: Option<NotCurrentContext>,
+    gl_possible_current_context: Option<PossiblyCurrentContext>,
+    painter: Option<egui_glow::Painter>,
     _phantom: std::marker::PhantomData<T>, // this does nothing, just keeps compiler happy
+}
+
+unsafe impl<T: UserEvent> Send for EguiPlugin<T> {}
+unsafe impl<T: UserEvent> Sync for EguiPlugin<T> {}
+
+impl<T: UserEvent> EguiPlugin<T> {
+
+    pub fn create_win_surface_with_gl_context(&mut self, window: &tauri::Window) -> Result<Surface<WindowSurface>, anyhow::Error>{
+        let raw_w_handle = get_raw_window_handle(window);
+
+        if self.gl_display.is_none() {
+            self.gl_display = Some(gen_display());
+
+            let template = glutin::config::ConfigTemplateBuilder::new()
+                .with_transparency(true)
+                .with_alpha_size(8).build();
+
+            let gl_config = unsafe {
+                let configs = self.gl_display
+                    .as_ref().expect("must have gl display")
+                    .find_configs(template).expect("No gl display configs found");
+                gl_config_picker(configs)
+            };
+            self.gl_config = Some(gl_config.clone());
+            
+            let gl_context_attributes= glutin::context::ContextAttributesBuilder::new().build(Some(raw_w_handle));
+            let gl_fallback_context_attributes = ContextAttributesBuilder::new()
+                .with_context_api(glutin::context::ContextApi::Gles(None))
+                .build(Some(raw_w_handle));
+            let legacy_context_attributes = ContextAttributesBuilder::new()
+                .with_context_api(glutin::context::ContextApi::OpenGl(Some(glutin::context::Version::new(2, 1))))
+                .build(Some(raw_w_handle));
+
+            let gl_not_current_context = unsafe {
+                let display = self.gl_display.as_ref().expect("must have gl display");
+                display.create_context(&gl_config, &gl_context_attributes).unwrap_or_else(|_| {
+                    display.create_context(&gl_config, &gl_fallback_context_attributes).unwrap_or_else(
+                        |_| {
+                            display
+                                .create_context(&gl_config, &legacy_context_attributes)
+                                .expect("failed to create context")
+                        },
+                    )
+                })
+            };
+
+            self.gl_not_current_context = Some(gl_not_current_context);
+        }
+
+        let win_size = window.inner_size().expect("Failed to get window size");
+
+        let surface_attributes = {
+            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
+                .build(
+                raw_w_handle,
+                    NonZero::new(win_size.width).unwrap_or(NonZero::new(10).unwrap()),
+                    NonZero::new(win_size.height).unwrap_or(NonZero::new(10).unwrap()),
+                )
+        };
+
+        let gl_config = self.gl_config.as_ref().expect("must have gl config");
+
+        let gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface> = unsafe {
+            gl_config.display().create_window_surface(&gl_config, &surface_attributes).expect("faile to create surface")
+        };
+
+        if self.gl_not_current_context.is_some() {
+            let not_current_context = self.gl_not_current_context.take();
+            let gl_possible_current_context = match not_current_context.map(|c| c.make_current(&gl_surface)) {
+                Some(Ok(c)) => Some(c),
+                None => None,
+                Some(Err(e)) => {
+                    eprintln!("Failed to make context current: {}", e);
+                    return Err(anyhow::Error::msg("Failed to make context current"));
+                }
+            };
+            self.gl_possible_current_context = gl_possible_current_context;
+        }
+
+        
+        if self.painter.is_none() {
+
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_has_shadow(false)
+                    .with_transparent(true),
+                    ..Default::default()
+            };
+
+            let gl_context = unsafe { 
+                glow::Context::from_loader_function(|s| {
+                    let s = std::ffi::CString::new(s)
+                    .expect("Failed to convert string to cstring for gl proc address loading");
+                    gl_config.display().get_proc_address(&s)
+            })};
+            let gl_context_ref = std::sync::Arc::new(gl_context);
+
+            let painter = egui_glow::Painter::new(
+                gl_context_ref, "", options.shader_version, options.dithering).expect("failed to create painter");
+            
+            self.painter = Some(painter);
+
+        }
+
+        Ok(gl_surface)
+    }
 }
 
 impl<T: UserEvent> EguiPlugin<T> {
@@ -78,6 +198,11 @@ impl<T: UserEvent> EguiPlugin<T> {
             windows,
             is_rdev_loop_running: Arc::new(AtomicBool::new(false)),
             rdev_thread_join_handle: None,
+            gl_config: None,
+            gl_display: None,
+            gl_not_current_context: None,
+            gl_possible_current_context: None,
+            painter: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -163,16 +288,18 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                                 egui_win.size = PhysicalSize::new(size.width, size.height);
                                 let width_px = NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN);
                                 let height_px = NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN);
-                                change_gl_context(
-                                    &mut egui_win.win_glow_context.gl_possible_current_context,
-                                    &mut egui_win.win_glow_context.gl_not_current_context,
-                                    &mut egui_win.win_glow_context.gl_surface);
-                                egui_win.win_glow_context.gl_surface.resize(
-                                    egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context"),
-                                    width_px,
-                                    height_px,
-                                );
-                                //egui_win.renderer.resize(size.width, size.height);
+
+                                if let Some(gl_surface) = egui_win.gl_surface.as_ref() {
+                                    change_gl_context(
+                                        &mut self.gl_possible_current_context,
+                                        &mut self.gl_not_current_context,
+                                        gl_surface);
+                                    gl_surface.resize(
+                                        self.gl_possible_current_context.as_ref().expect("failed to get current context"),
+                                        width_px,
+                                        height_px,
+                                    );
+                                }
                                 return true;
                             }
                             TaoWindowEvent::Destroyed => {
@@ -180,7 +307,6 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                                     on_destroy(label.clone());
                                 }
                                 egui_win.context.forget_all_images();
-                                egui_win.win_glow_context.painter.destroy();
                                 windows.remove(&label);
                                 return false;
                             }
@@ -208,7 +334,8 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
             }
             Event::RedrawRequested(window_id) => {
                 if let Some(label) = get_label_from_tao_id(window_id, &context) {
-                    let mut windows = self.windows.lock().unwrap();
+                    let windows_map = self.windows.clone();
+                    let mut windows = windows_map.lock().unwrap();
                     if !windows.contains_key(&label) {
                         let mut staging_window = self.staging_window.lock().unwrap();
                         let staging_lable_opt = staging_window.window.as_ref()
@@ -222,6 +349,17 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                         }
                     }
                     if let Some(egui_win) = windows.get_mut(&label) {
+                        if egui_win.gl_surface.is_none() {
+                            let gl_surface = match self.create_win_surface_with_gl_context(&egui_win.window) {
+                                Ok(surface) => surface,
+                                Err(e) => {
+                                    eprintln!("Error creating gl surface: {}", e);
+                                    return false;
+                                }
+                            };
+                            egui_win.gl_surface = Some(gl_surface);
+                        }
+
                         // Get the egui context from the EguiWindow
                         let raw_input = egui_win.take_egui_input();
 
@@ -261,21 +399,26 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
                             pixels_per_point: pixels_per_point,
                         };
 
-                        let is_current = egui_win.win_glow_context.gl_surface.is_current(egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context"));
+                        change_gl_context(
+                            &mut self.gl_possible_current_context,
+                            &mut self.gl_not_current_context,
+                            &mut egui_win.gl_surface.as_ref().expect("failed to get gl surface"));
 
                         // Finally we render textures, paint jobs, etc. using the GPU
-                        egui_win.win_glow_context.painter.clear(
+                        let mut painter = self.painter.as_mut().expect("failed to get painter");
+                        painter.clear(
                             screen_descriptor.size_in_pixels, [0.0, 0.0, 0.0, 0.0],);
 
-                        egui_win.win_glow_context.painter.paint_and_update_textures(
+                        painter.paint_and_update_textures(
                             screen_descriptor.size_in_pixels,
                             screen_descriptor.pixels_per_point,
                             &paint_jobs,
                             &textures_delta,
                         );
 
-                        if let Err(err) = egui_win.win_glow_context.gl_surface.swap_buffers(
-                            &egui_win.win_glow_context.gl_possible_current_context.as_ref().expect("failed to get current context")) {
+                        let gl_surface = egui_win.gl_surface.as_ref().expect("failed to get gl surface");
+                        if let Err(err) = gl_surface.swap_buffers(
+                            &self.gl_possible_current_context.as_ref().expect("failed to get current context")) {
                             println!("swap_buffers failed: {err}");
                         }
 
@@ -302,8 +445,9 @@ impl<T: UserEvent> Plugin<T> for EguiPlugin<T> {
 /// A collection egui context, renderer and a UI function
 struct EguiWindow {
     label: String,
+    window: tauri::Window,
     context: egui::Context,
-    win_glow_context: super::utils::WindowGlowContext,
+    gl_surface: Option<Surface<WindowSurface>>,
     size: PhysicalSize<u32>,
     ui_fn: Box<dyn FnMut(&egui::Context)>,
     on_destroy: Option<Box<dyn FnMut(String)>>,
@@ -675,8 +819,6 @@ impl AppHandleExt for AppHandle {
         let context = egui::Context::default();
         context.set_zoom_factor(scale_factor);
 
-        let win_glow_context = super::utils::create_window_painter(&window)?;
-
         // check if plugin is init'd
         let staging_window= self
             .try_state::<StagingWindow>()
@@ -688,8 +830,8 @@ impl AppHandleExt for AppHandle {
             label.to_string(),
             EguiWindow {
                 label: label.to_string(),
+                window,
                 context,
-                win_glow_context,
                 ui_fn,
                 on_destroy,
                 size,
@@ -697,6 +839,7 @@ impl AppHandleExt for AppHandle {
                 egui_input: egui::RawInput::default(),
                 pointer_pos: None,
                 scale_factor,
+                gl_surface: None,
                 modifiers: egui::Modifiers::NONE,
             },
         ));
